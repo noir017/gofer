@@ -14,6 +14,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-sasl"
 
+	"github.com/cristianadrielbraun/gofer/internal/buildinfo"
 	"github.com/cristianadrielbraun/gofer/internal/mail/oauth2sasl"
 	mailtransport "github.com/cristianadrielbraun/gofer/internal/mail/transport"
 	"github.com/cristianadrielbraun/gofer/internal/models"
@@ -145,6 +146,12 @@ func connectWithContext(ctx context.Context, cfg *models.AccountConfig, password
 	if err != nil {
 		c.Close()
 		return nil, fmt.Errorf("authenticate: %w", err)
+	}
+
+	// NetEase servers reject SELECT with "Unsafe Login" unless the client
+	// identifies itself through the ID extension (RFC 2971) after login.
+	if caps, capErr := c.Capability().Wait(); capErr == nil && caps.Has(imap.CapID) {
+		_, _ = c.ID(&imap.IDData{Name: "Gofer", Version: buildinfo.Version, Vendor: "Gofer"}).Wait()
 	}
 
 	return c, nil
