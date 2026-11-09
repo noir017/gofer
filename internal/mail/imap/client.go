@@ -132,6 +132,14 @@ func connectWithContext(ctx context.Context, cfg *models.AccountConfig, password
 		saslClient := sasl.NewPlainClient("", cfg.Username, password)
 		err = c.Authenticate(saslClient)
 	}
+	if err != nil && cfg.AuthMethod != "oauth2" {
+		// Some providers only implement the LOGIN command and reject
+		// AUTHENTICATE PLAIN (163.com, 139.com); retry with LOGIN before
+		// giving up on the session.
+		if loginErr := c.Login(cfg.Username, password).Wait(); loginErr == nil {
+			err = nil
+		}
+	}
 
 	err = defaultLoginCooldowns.record(cfg, err)
 	if err != nil {
@@ -158,6 +166,22 @@ func tlsHandshake(ctx context.Context, conn net.Conn, config *tls.Config, timeou
 	return tlsConn, nil
 }
 
+// imapCipherSuites keeps the Go defaults and appends RSA key-exchange suites.
+// Some mail providers (imap.139.com) only offer those, and Go no longer enables
+// them by default, which otherwise makes the TLS handshake fail outright.
+func imapCipherSuites() []uint16 {
+	suites := make([]uint16, 0, 16)
+	for _, cs := range tls.CipherSuites() {
+		suites = append(suites, cs.ID)
+	}
+	return append(suites,
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+	)
+}
+
 func secureClientOptions(host string, options *imapclient.Options) *imapclient.Options {
 	if options == nil {
 		options = &imapclient.Options{}
@@ -171,6 +195,9 @@ func secureClientOptions(host string, options *imapclient.Options) *imapclient.O
 	tlsConfig.InsecureSkipVerify = false
 	if tlsConfig.MinVersion < tls.VersionTLS12 {
 		tlsConfig.MinVersion = tls.VersionTLS12
+	}
+	if len(tlsConfig.CipherSuites) == 0 {
+		tlsConfig.CipherSuites = imapCipherSuites()
 	}
 	clientOptions.TLSConfig = tlsConfig
 	options = &clientOptions
