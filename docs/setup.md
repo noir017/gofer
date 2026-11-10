@@ -1,5 +1,7 @@
 # Setting up Gofer
 
+**English** · [简体中文](./setup.zh-CN.md)
+
 Everything about configuring, upgrading, and deploying Gofer. For a quick start, see the [README](../README.md).
 
 ## auth modes and storage
@@ -32,6 +34,8 @@ Gofer doesn't connect to servers on private network addresses unless they are ap
 In managed mode, the admin panel's Mail security page can also limit the mail servers mailboxes connect to (IMAP, SMTP, JMAP, CalDAV, and CardDAV, such as `imap.example.org` or `*.example.org`) and the domains of their addresses. Gmail and Outlook are refused while the servers are limited, unless you allow them there. Mailboxes outside the lists stop connecting and are listed on that page, and you can choose people the lists don't apply to. Empty lists limit nothing.
 
 Gofer looks up sender pictures from Gravatar, Libravatar, BIMI, and the sender domain's website icon. The last two contact servers chosen by whoever sent the mail. To keep Gofer from reaching them, set `GOFER_AVATAR_PROVIDERS=gravatar,libravatar`, or `none` to turn sender picture lookups off.
+
+Set `GOFER_GOOGLE_FONTS=true` to let people pick text and heading fonts from the Google Fonts library under Settings, Appearance. The fonts apply to every style except Express. Gofer fetches the family list, stylesheets and font files itself, keeps them in `google-fonts/` next to the database, and serves them from its own address.
 
 Runtime data is stored in `data/` by default. Protect the data directory, configuration, and secrets, and back them up together before upgrades. Shared databases apply schema migrations at startup, and managed mode converts them to per-user storage as described in [pre-0.5.0-migration.md](./pre-0.5.0-migration.md). Going back to an older version may require restoring its matching backup, and the retained shared database does not include changes made after conversion. I recommend testing your providers and access setup before relying on Gofer for anything critical.
 

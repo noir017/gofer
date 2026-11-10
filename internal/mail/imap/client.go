@@ -91,7 +91,7 @@ func connectWithContext(ctx context.Context, cfg *models.AccountConfig, password
 	default:
 		return nil, fmt.Errorf("unsupported IMAP TLS mode %q", tlsMode)
 	}
-	conn, err := netguard.Dial(ctx, options.Dialer, "imap", cfg.IMAPHost, cfg.IMAPPort, cfg.IMAPAllowPrivate)
+	conn, err := netguard.Dial(netguard.WithProxy(ctx, cfg.Proxy), options.Dialer, "imap", cfg.IMAPHost, cfg.IMAPPort, cfg.IMAPAllowPrivate)
 	if err == nil && tlsMode == mailtransport.TLSModeImplicit {
 		tlsOptions := options.TLSConfig.Clone()
 		if tlsOptions.NextProtos == nil {
@@ -111,7 +111,8 @@ func connectWithContext(ctx context.Context, cfg *models.AccountConfig, password
 	if tlsMode == mailtransport.TLSModeStartTLS {
 		c, err = imapclient.NewStartTLS(conn, options)
 	} else {
-		c = imapclient.New(conn, options)
+		// STARTTLS can't have the filter: go-imap starts its TLS beneath it.
+		c = imapclient.New(newStatusFixConn(conn), options)
 	}
 	if err != nil {
 		_ = conn.Close()
@@ -122,39 +123,32 @@ func connectWithContext(ctx context.Context, cfg *models.AccountConfig, password
 		return nil, fmt.Errorf("wait for greeting: %w", err)
 	}
 
-	switch cfg.AuthMethod {
-	case "plain":
-		saslClient := sasl.NewPlainClient("", cfg.Username, password)
-		err = c.Authenticate(saslClient)
-	case "oauth2":
-		saslClient := oauth2sasl.NewClient(cfg.Username, password)
-		err = c.Authenticate(saslClient)
-	default:
-		saslClient := sasl.NewPlainClient("", cfg.Username, password)
-		err = c.Authenticate(saslClient)
-	}
-	if err != nil && cfg.AuthMethod != "oauth2" {
-		// Some providers only implement the LOGIN command and reject
-		// AUTHENTICATE PLAIN (163.com, 139.com); retry with LOGIN before
-		// giving up on the session.
-		if loginErr := c.Login(cfg.Username, password).Wait(); loginErr == nil {
-			err = nil
-		}
-	}
-
-	err = defaultLoginCooldowns.record(cfg, err)
+	err = defaultLoginCooldowns.record(cfg, authenticate(c, cfg, password))
 	if err != nil {
 		c.Close()
 		return nil, fmt.Errorf("authenticate: %w", err)
 	}
 
-	// NetEase servers reject SELECT with "Unsafe Login" unless the client
-	// identifies itself through the ID extension (RFC 2971) after login.
-	if caps, capErr := c.Capability().Wait(); capErr == nil && caps.Has(imap.CapID) {
-		_, _ = c.ID(&imap.IDData{Name: "Gofer", Version: buildinfo.Version, Vendor: "Gofer"}).Wait()
+	// Some servers, such as 163.com, refuse SELECT with "Unsafe Login" until
+	// the client identifies itself (RFC 2971). Their answer doesn't matter.
+	if c.Caps().Has(imap.CapID) {
+		_, _ = c.ID(&imap.IDData{Name: "Gofer", Version: buildinfo.Version}).Wait()
 	}
 
 	return c, nil
+}
+
+func authenticate(c *imapclient.Client, cfg *models.AccountConfig, password string) error {
+	if cfg.AuthMethod == "oauth2" {
+		return c.Authenticate(oauth2sasl.NewClient(cfg.Username, password))
+	}
+	// IMAP4rev1 servers don't have to offer AUTHENTICATE PLAIN: 163.com
+	// advertises only AUTH=XOAUTH2 and 139.com no mechanism at all. Both
+	// accept LOGIN.
+	if caps := c.Caps(); caps != nil && !caps.Has(imap.AuthCap(sasl.Plain)) && !caps.Has(imap.CapLoginDisabled) {
+		return c.Login(cfg.Username, password).Wait()
+	}
+	return c.Authenticate(sasl.NewPlainClient("", cfg.Username, password))
 }
 
 // tlsHandshake starts TLS on a connection opened by netguard. The timeout
@@ -173,21 +167,17 @@ func tlsHandshake(ctx context.Context, conn net.Conn, config *tls.Config, timeou
 	return tlsConn, nil
 }
 
-// imapCipherSuites keeps the Go defaults and appends RSA key-exchange suites.
-// Some mail providers (imap.139.com) only offer those, and Go no longer enables
-// them by default, which otherwise makes the TLS handshake fail outright.
-func imapCipherSuites() []uint16 {
-	suites := make([]uint16, 0, 16)
-	for _, cs := range tls.CipherSuites() {
-		suites = append(suites, cs.ID)
+// imapCipherSuites are Go's defaults followed by RSA key exchange with
+// AES-GCM. Go no longer offers RSA key exchange as it has no forward secrecy,
+// but imap.139.com accepts nothing else. A server only gets it by choosing it
+// over every default suite, and TLS 1.3 never uses this list.
+var imapCipherSuites = func() []uint16 {
+	var suites []uint16
+	for _, suite := range tls.CipherSuites() {
+		suites = append(suites, suite.ID)
 	}
-	return append(suites,
-		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-		tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-	)
-}
+	return append(suites, tls.TLS_RSA_WITH_AES_128_GCM_SHA256, tls.TLS_RSA_WITH_AES_256_GCM_SHA384)
+}()
 
 func secureClientOptions(host string, options *imapclient.Options) *imapclient.Options {
 	if options == nil {
@@ -203,8 +193,8 @@ func secureClientOptions(host string, options *imapclient.Options) *imapclient.O
 	if tlsConfig.MinVersion < tls.VersionTLS12 {
 		tlsConfig.MinVersion = tls.VersionTLS12
 	}
-	if len(tlsConfig.CipherSuites) == 0 {
-		tlsConfig.CipherSuites = imapCipherSuites()
+	if tlsConfig.CipherSuites == nil {
+		tlsConfig.CipherSuites = imapCipherSuites
 	}
 	clientOptions.TLSConfig = tlsConfig
 	options = &clientOptions

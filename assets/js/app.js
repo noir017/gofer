@@ -155,15 +155,17 @@ function toolbarFoldWidth(el) {
 
 // toolbarFoldParts gives each folding part with the width it takes now
 // (mid-animation, maybe) and the width it takes when shown, both counting
-// the flex gap beside it.
+// the flex gap beside it. It only measures; toolbarFoldStep writes each
+// part's --collapse-width once the whole toolbar is measured, since writing
+// between measurements laid out the page again for each part, which made
+// coming back to the list on a phone wait.
 function toolbarFoldParts(states) {
   var parts = []
   states.forEach(function (_, el) {
     var gap = parseFloat(getComputedStyle(el.parentElement).columnGap) || 0
     var margin = parseFloat(getComputedStyle(el).marginLeft) || 0
     var width = toolbarFoldWidth(el)
-    if (el.style.getPropertyValue("--collapse-width") !== width + "px") el.style.setProperty("--collapse-width", width + "px")
-    parts.push({ el: el, current: el.offsetWidth + gap + margin, full: width + gap })
+    parts.push({ el: el, current: el.offsetWidth + gap + margin, full: width + gap, width: width })
   })
   return parts
 }
@@ -176,7 +178,12 @@ function toolbarFoldStep(toolbar, spacer, steps, statesAt) {
   var spacerExtra = spacer && spacer.offsetParent ? spacer.offsetWidth - (parseFloat(getComputedStyle(spacer).minWidth) || 0) : 0
   // The width everything but the folding parts needs.
   var fixed = Math.max(toolbar.scrollWidth, toolbar.clientWidth) - spacerExtra
-  for (var i = 0; i < parts.length; i++) fixed -= parts[i].current
+  var room = toolbar.clientWidth
+  for (var i = 0; i < parts.length; i++) {
+    fixed -= parts[i].current
+    var width = parts[i].width + "px"
+    if (parts[i].el.style.getPropertyValue("--collapse-width") !== width) parts[i].el.style.setProperty("--collapse-width", width)
+  }
   var step = 0
   for (; step < steps; step++) {
     var needed = fixed
@@ -184,7 +191,7 @@ function toolbarFoldStep(toolbar, spacer, steps, statesAt) {
     for (var j = 0; j < parts.length; j++) {
       if (!states.get(parts[j].el)) needed += parts[j].full
     }
-    if (needed <= toolbar.clientWidth) break
+    if (needed <= room) break
   }
   return step
 }
@@ -511,6 +518,7 @@ document.addEventListener("DOMContentLoaded", function () {
   setupSidebarAccountCollapse()
   setupProcessingStatus()
   setupBodyPrefetch()
+  setupTouchPress()
   setupEmailBodyModeTabs()
   setupEmailTranslation()
   setupMailtoIntent()
@@ -1064,6 +1072,10 @@ document.addEventListener("DOMContentLoaded", function () {
         var contactSortOrder = e.target.querySelector('[name="sort_order"]:checked')
         GoferSettings.set("contacts_list_sort_by", contactSortBy ? contactSortBy.value || "updated" : "updated")
         GoferSettings.set("contacts_list_sort_order", contactSortOrder ? contactSortOrder.value || "desc" : "desc")
+      }
+      if (e.target.matches("[data-contact-sort-form]") && window.animateContactSortLabel) {
+        var sortByInput = e.target.querySelector('[name="sort_by"]')
+        window.animateContactSortLabel(contactSortLabelText(sortByInput ? sortByInput.value : ""))
       }
       applyFilters()
     }, true)
@@ -1803,6 +1815,30 @@ document.addEventListener("DOMContentLoaded", function () {
       return frame && frame.dataset.translationTargetLanguage ? frame.dataset.translationTargetLanguage : targetLanguage()
     }
 
+    // fillTranslationLanguageMenu copies the reader's languages into a
+    // message's menu, the first time it is about to open (see
+    // translationLanguageItems in mailview.templ).
+    function fillTranslationLanguageMenu(trigger) {
+      var root = trigger.closest("[data-tui-popover-root]")
+      var menu = root && root.querySelector(":scope > [data-translation-language-menu]")
+      if (!menu || menu.querySelector("[data-translation-language]")) return
+      var source = document.querySelector("template[data-translation-language-items]")
+      if (!source) return
+      var emailId = menu.getAttribute("data-translation-language-menu")
+      var items = source.content.cloneNode(true)
+      items.querySelectorAll("[data-translation-language]").forEach(function (item) {
+        item.setAttribute("data-translate-email-language", emailId)
+      })
+      menu.appendChild(items)
+      syncTranslationLanguageItems(emailId)
+    }
+    ;["pointerdown", "keydown", "focusin"].forEach(function (type) {
+      document.addEventListener(type, function (e) {
+        var trigger = e.target.closest && e.target.closest(".email-translation-language-trigger")
+        if (trigger) fillTranslationLanguageMenu(trigger)
+      }, true)
+    })
+
     function syncTranslationLanguageItems(emailId) {
       if (!emailId) return
       var active = normalizeTranslationLanguageCode(activeTargetLanguage(emailId))
@@ -2181,6 +2217,18 @@ document.addEventListener("DOMContentLoaded", function () {
       lastSelectedMailId = row.dataset.emailId
       syncMailSelectionControls()
     }, true)
+
+    // A finger on a thread's toggle starts fetching its messages, so they are
+    // often in by the time the tap ends and the thread opens.
+    document.addEventListener("pointerdown", function (e) {
+      if (e.pointerType === "mouse") return
+      var toggle = e.target.closest && e.target.closest("#mail-list-scroll [data-thread-toggle]")
+      if (!toggle) return
+      var scroll = document.getElementById("mail-list-scroll")
+      var list = (scroll && scroll._virtualMailList) || virtualMailList
+      var emailId = toggle.dataset.threadToggle
+      if (list && emailId && !list.expandedThreads.has(emailId)) list.prefetchThreadSubItems(emailId)
+    }, { passive: true })
 
     document.addEventListener("click", function (e) {
       var rowLink = e.target.closest && e.target.closest(".mail-list-item[data-email-id] > a")
@@ -3272,6 +3320,16 @@ document.addEventListener("DOMContentLoaded", function () {
       var hideViewLabels = actions ? step >= CONTACT_LIST_STEPS : step >= 2
       toolbar.querySelectorAll("[data-contact-view-label]").forEach(function (label) { states.set(label, hideViewLabels) })
       return states
+    }
+
+    // Changes the sort label's text while its width slides to the new size,
+    // as animateMailSortLabel does for the mail list.
+    window.animateContactSortLabel = function (text) {
+      var label = document.querySelector("[data-contact-sort-label]")
+      if (!label || label.textContent === text) return
+      label.textContent = text
+      label.style.setProperty("--collapse-width", toolbarFoldWidth(label) + "px")
+      syncContactListOverflow()
     }
 
     function syncContactListOverflow() {
@@ -4910,8 +4968,23 @@ document.addEventListener("DOMContentLoaded", function () {
       }
     }
 
+    // The toolbar's folding and its Delete slot follow only the selection,
+    // the folder's Delete button and running actions; a resize refolds it on
+    // its own. The list calls this on every redraw, as when a thread opens,
+    // so with none of those changed the toolbar isn't measured again: that
+    // laid out the whole page each time, which a phone felt on every tap.
+    var syncedMailToolbar = null
+    var syncedMailToolbarState = ""
+
+    function mailToolbarState() {
+      var deleteButton = document.querySelector('.mail-list-toolbar [data-mail-selection-action="delete"]')
+      return [selectedMailIds.size, mailSelectionModeActive(), keepMailSelectionModeWhenEmpty, mailSelectionBusy, deleteButton ? deleteButton.dataset.mailDeleteAllFolder || "" : ""].join("|")
+    }
+
     function syncMailSelectionControls() {
-      var deleteSlotFrom = mailDeleteSlotLeft()
+      var toolbar = document.querySelector(".mail-list-toolbar")
+      var toolbarSynced = !!toolbar && toolbar === syncedMailToolbar && mailToolbarState() === syncedMailToolbarState
+      var deleteSlotFrom = toolbarSynced ? null : mailDeleteSlotLeft()
       syncMailSelectAllControls(selectedMailIds.size)
       syncMailRowSelection()
 
@@ -4936,8 +5009,11 @@ document.addEventListener("DOMContentLoaded", function () {
       if (list) list.toggleAttribute("data-mail-has-selection", count > 0)
       syncMailDeleteAllAction(count)
       syncMailSelectionToggles(count)
+      if (toolbarSynced) return
       syncMailActionOverflow()
       slideMailDeleteSlot(deleteSlotFrom)
+      syncedMailToolbar = toolbar
+      syncedMailToolbarState = mailToolbarState()
     }
 
     // syncMailDeleteActionState, outside this scope, follows a folder switch with this.
@@ -7874,6 +7950,36 @@ document.addEventListener("DOMContentLoaded", function () {
     initSearchStateFromInput()
   }
 
+  // setupTouchPress marks what a finger is on with data-touch-pressed, so it
+  // shows pressed at once (see the pressed styles in input.css). A scroll
+  // cancels the pointer, which lets go of it; a tap keeps it a moment after
+  // the finger lifts, so even a quick one shows.
+  function setupTouchPress() {
+    var selector = "#mail-list-scroll [data-thread-toggle], #mail-list-scroll .mail-list-item[data-email-id] > a, #mail-list-scroll .thread-sub-item[data-sub-email-id] > a, #mail-view .mail-view-actions button, #mail-view .mobile-back-button"
+    var pressed = null
+    var releaseTimer = null
+    function release() {
+      if (releaseTimer) clearTimeout(releaseTimer)
+      releaseTimer = null
+      if (pressed) pressed.removeAttribute("data-touch-pressed")
+      pressed = null
+    }
+    document.addEventListener("pointerdown", function (e) {
+      if (e.pointerType !== "touch" && e.pointerType !== "pen") return
+      release()
+      var target = e.target && e.target.closest && e.target.closest(selector)
+      if (!target) return
+      pressed = target
+      target.setAttribute("data-touch-pressed", "")
+    }, { passive: true })
+    document.addEventListener("pointercancel", release, { passive: true })
+    document.addEventListener("pointerup", function () {
+      if (!pressed) return
+      if (releaseTimer) clearTimeout(releaseTimer)
+      releaseTimer = setTimeout(release, 120)
+    }, { passive: true })
+  }
+
   function setupBodyPrefetch() {
     var hoverPrefetchDelay = 300
     var scrollPrefetchCooldown = 200
@@ -7939,6 +8045,38 @@ document.addEventListener("DOMContentLoaded", function () {
     document.addEventListener("focusin", function (e) {
       prefetchRow(e.target && e.target.closest && e.target.closest(".mail-list-item[data-email-id]"))
     })
+
+    // A finger resting on a row for a moment starts fetching its body, so
+    // the server is already getting it from the mail server when the tap
+    // opens the message. A scroll starts with a touch too: the browser
+    // cancels the pointer when it scrolls, and that drops the fetch.
+    var touchPrefetchDelay = 60
+    var touchPrefetchTimer = null
+    var touchPrefetchRow = null
+    function clearTouchPrefetch() {
+      if (touchPrefetchTimer) clearTimeout(touchPrefetchTimer)
+      touchPrefetchTimer = null
+      touchPrefetchRow = null
+    }
+    document.addEventListener("pointerdown", function (e) {
+      if (e.pointerType !== "touch" && e.pointerType !== "pen") return
+      clearTouchPrefetch()
+      var row = e.target && e.target.closest && e.target.closest("#mail-list-scroll .mail-list-item[data-email-id]")
+      if (!row || e.target.closest(".star-btn, [data-thread-toggle], [data-mail-row-check]")) return
+      touchPrefetchRow = row
+      touchPrefetchTimer = setTimeout(function () {
+        clearTouchPrefetch()
+        prefetchRow(row)
+      }, touchPrefetchDelay)
+    }, { passive: true })
+    document.addEventListener("pointercancel", clearTouchPrefetch, { passive: true })
+    document.addEventListener("pointerup", function () {
+      // A quick tap ends before the delay; it opens the message, so the
+      // body is wanted now. A scroll never gets here: it cancels first.
+      var row = touchPrefetchRow
+      clearTouchPrefetch()
+      if (row) prefetchRow(row)
+    }, { passive: true })
   }
 
   function markAccountDeleting(accountId) {
@@ -8052,9 +8190,16 @@ document.addEventListener("DOMContentLoaded", function () {
       cards.forEach(function (card) { trackAccountDeletion(card.dataset.accountId) })
     }
 
+    // Only deleting an account answers DELETE /api/accounts/<id>; other
+    // requests there, such as GET /api/accounts/proxy-choice, are not deletes.
+    function isAccountDelete(evt) {
+      var verb = evt.detail.requestConfig && evt.detail.requestConfig.verb
+      return String(verb || "").toLowerCase() === "delete"
+    }
+
     document.body.addEventListener("htmx:beforeRequest", function (evt) {
       var path = evt.detail.pathInfo && evt.detail.pathInfo.requestPath
-      if (!path || !path.match(/^\/api\/accounts\/[^/]+$/)) return
+      if (!isAccountDelete(evt) || !path || !path.match(/^\/api\/accounts\/[^/]+$/)) return
       var button = evt.detail.elt && evt.detail.elt.closest ? evt.detail.elt.closest("[data-account-delete-submit]") : null
       if (!button) return
       button.dataset.originalContent = button.innerHTML
@@ -8064,7 +8209,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
     document.body.addEventListener("htmx:afterRequest", function (evt) {
       var path = evt.detail.pathInfo && evt.detail.pathInfo.requestPath
-      var match = path && path.match(/^\/api\/accounts\/([^/]+)$/)
+      var match = isAccountDelete(evt) && path && path.match(/^\/api\/accounts\/([^/]+)$/)
       if (!match || !evt.detail.xhr) return
       var accountId = decodeURIComponent(match[1])
       var button = evt.detail.elt && evt.detail.elt.closest ? evt.detail.elt.closest("[data-account-delete-submit]") : null
@@ -8115,6 +8260,7 @@ document.addEventListener("DOMContentLoaded", function () {
       oauth_metadata_failed: goferT("js.accounts.connect_error.oauth_metadata_failed"),
       oauth_sync_failed: goferT("js.accounts.connect_error.oauth_sync_failed"),
       create_failed: goferT("js.accounts.connect_error.create_failed"),
+      proxy_unavailable: goferT("js.accounts.connect_error.proxy_unavailable"),
       mail_allowlist_provider: goferT("js.accounts.connect_error.mail_allowlist_provider"),
       mail_allowlist_domain: goferT("js.accounts.connect_error.mail_allowlist_domain"),
     }
@@ -8822,7 +8968,7 @@ document.addEventListener("DOMContentLoaded", function () {
         return Promise.reject(new Error(goferT("js.notify.permission_denied")))
       }
       var appearance = newMailNotificationAppearance(notificationAppearanceExample(), 1)
-      return window.GoferNotificationAvatar.render(appearance.icon).then(function (circularIcon) {
+      return window.GoferNotificationAvatar.render(appearance.icon, appearance.initials).then(function (circularIcon) {
         var notification = new Notification(appearance.title, {
           body: appearance.body,
           tag: "gofer-test-notification",
@@ -9033,8 +9179,11 @@ document.addEventListener("DOMContentLoaded", function () {
       if (chars.length > 180) preview = chars.slice(0, 180).join("") + "…"
       if (preview) body += "\n" + preview
     }
-    var icon = setting("notification_icon") === "gofer" ? "/assets/logo.png" : String(data.avatar_url || data.icon || "/assets/logo.png")
-    return { title: title, body: body, icon: icon }
+    var avatar = setting("notification_icon") !== "gofer"
+    var icon = avatar ? String(data.avatar_url || data.icon || "/assets/logo.png") : "/assets/logo.png"
+    // Without a picture the sender's avatar is their initials.
+    var initials = avatar && (data.from_name || data.from_email) ? _composeRecipientInitials(data.from_name, data.from_email) : ""
+    return { title: title, body: body, icon: icon, initials: initials }
   }
 
   function notificationAppearanceExample() {
@@ -9068,7 +9217,7 @@ document.addEventListener("DOMContentLoaded", function () {
     var appearance = newMailNotificationAppearance(data, unreadCount)
     var folderName = String(data.folder_name || goferT("js.mail.inbox"))
 
-    return window.GoferNotificationAvatar.render(appearance.icon).then(function (circularIcon) {
+    return window.GoferNotificationAvatar.render(appearance.icon, appearance.initials).then(function (circularIcon) {
       var notification = new Notification(appearance.title, {
         body: appearance.body,
         tag: "gofer-new-mail-" + (data.account_id || "") + "-" + (data.folder_id || folderName),
@@ -10486,6 +10635,12 @@ document.addEventListener("DOMContentLoaded", function () {
     '</div>'
   }
 
+  // Mirrors contactSortLabel in contacts.templ.
+  function contactSortLabelText(sortBy) {
+    var known = { name: true, created: true, last_interaction: true }
+    return goferT("js.contacts.sort." + (known[sortBy] ? sortBy : "updated"))
+  }
+
   // Mirrors mailSortLabel in maillist.templ.
   function mailSortLabelText(sortBy) {
     var known = { sender: true, subject: true, size: true, unread: true, starred: true, attachments: true }
@@ -10509,8 +10664,7 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function contactsPendingToolbarHTML(viewMode) {
-    var sortBy = window.GoferSettings ? GoferSettings.get("contacts_list_sort_by") : "updated"
-    var sortLabel = sortBy === "name" ? goferT("js.contacts.sort.name") : (sortBy === "created" ? goferT("js.contacts.sort.created") : (sortBy === "last_interaction" ? goferT("js.contacts.sort.last_interaction") : goferT("js.contacts.sort.updated")))
+    var sortLabel = contactSortLabelText(window.GoferSettings ? GoferSettings.get("contacts_list_sort_by") : "updated")
     // Mirrors the contacts toolbar: select-all, the view and sort; filters
     // sit beside the search.
     return '<div class="flex items-center gap-1 px-4 py-1.5">' +
@@ -18994,11 +19148,53 @@ function _isComposeRecipientValid(value) {
   return /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(_composeRecipientEmail(value))
 }
 
+// _scanComposeRecipients walks an address list and calls cut(i) at each
+// separator (comma, semicolon or newline) between entries, skipping those
+// inside a quoted name, a comment or an angle address, so a name such as
+// "Pérez, Juan" stays one entry. It answers whether a quote, comment or angle
+// address was left open at the end.
+function _scanComposeRecipients(text, cut) {
+  var quoted = false, escaped = false, depth = 0, angle = false
+  for (var i = 0; i < text.length; i++) {
+    var c = text.charAt(i)
+    if (escaped) { escaped = false; continue }
+    if (c === "\\" && (quoted || depth > 0)) { escaped = true; continue }
+    if (quoted) { if (c === '"') quoted = false; continue }
+    if (c === '"') quoted = true
+    else if (c === "(") depth++
+    else if (c === ")" && depth > 0) depth--
+    else if (depth > 0) continue
+    else if (c === "<") angle = true
+    else if (c === ">") angle = false
+    else if (!angle && (c === "," || c === ";" || c === "\n")) cut(i)
+  }
+  return quoted || depth > 0 || angle
+}
+
 function _splitComposeRecipients(value) {
-  return String(value || "")
-    .split(/[;,\n]+/) 
-    .map(function (part) { return part.trim() })
-    .filter(Boolean)
+  var text = String(value || "")
+  var parts = []
+  var start = 0
+  _scanComposeRecipients(text, function (i) {
+    parts.push(text.slice(start, i))
+    start = i + 1
+  })
+  parts.push(text.slice(start))
+  return parts.map(function (part) { return part.trim() }).filter(Boolean)
+}
+
+// _composeRecipientHasSeparator says whether typed text holds a separator
+// between entries; one inside a quoted name doesn't end the entry.
+function _composeRecipientHasSeparator(text) {
+  var found = false
+  _scanComposeRecipients(String(text || ""), function () { found = true })
+  return found
+}
+
+// _composeRecipientOpen says whether typed text ends inside a quoted name,
+// a comment or an angle address, where a comma is part of the entry.
+function _composeRecipientOpen(text) {
+  return _scanComposeRecipients(String(text || ""), function () {})
 }
 
 var _composeRecipientSuggestTimer = null
@@ -19425,6 +19621,7 @@ function handleComposeRecipientKeydown(event) {
     return
   }
   if (event.key === "Enter" || event.key === "Tab" || event.key === "," || event.key === ";") {
+    if ((event.key === "," || event.key === ";") && _composeRecipientOpen(input.textContent || "")) return
     if ((input.textContent || "").trim()) {
       event.preventDefault()
       finalizeComposeRecipientInput(input)
@@ -19441,7 +19638,7 @@ function handleComposeRecipientKeydown(event) {
 
 function handleComposeRecipientInput(input) {
   var text = input.textContent || ""
-  if (/[;,\n]/.test(text)) finalizeComposeRecipientInput(input)
+  if (_composeRecipientHasSeparator(text)) finalizeComposeRecipientInput(input)
   else {
     _scheduleComposeRecipientSuggestions(input)
     // Typing can wrap the input onto a new line.
@@ -19687,6 +19884,10 @@ function _sanitizeComposeHTML(html, allowDataImages) {
 
 function _composeEditorText(editor) {
   if (!editor) return ""
+  // innerText lays the page out, and leaving the reader asks the hidden
+  // compose window for it; an editor without a visible character has no text
+  // to give, so textContent answers that without any layout.
+  if (!/\S/.test((editor.textContent || "").replace(/\u00a0/g, " "))) return ""
   return (editor.innerText || "").replace(/\u00a0/g, " ").replace(/\n{3,}/g, "\n\n").trim()
 }
 
@@ -21912,6 +22113,22 @@ function composeAddress(name, email) {
   return name ? name + " <" + email + ">" : email
 }
 
+// composeRecipientAddress is an address for a recipient field: like
+// composeAddress, but a name with a comma, an "@" or another character an
+// address list gives a meaning to is quoted, and a name that is just the
+// address is left out, so the list reads back as the same people. Mirrors
+// message.FormatAddress on the server.
+function composeRecipientAddress(name, email) {
+  email = String(email || "").trim()
+  name = String(name || "").trim()
+  if (!email) return ""
+  if (!name || name.toLowerCase() === email.toLowerCase()) return email
+  if (/[()<>\[\]:;@\\,."]/.test(name) && !/^"(?:[^"\\]|\\.)*"$/.test(name)) {
+    name = '"' + name.replace(/[\\"]/g, "\\$&") + '"'
+  }
+  return name + " <" + email + ">"
+}
+
 function composeNormalizeMessageID(messageId) {
   messageId = String(messageId || "").trim()
   if (!messageId) return ""
@@ -22139,16 +22356,17 @@ function composeValuesFromSource(source, mode) {
     _composeDirty: "true"
   }
   if (mode === "reply" || mode === "reply-all") {
-    vals.to = mode === "reply-all" ? composeDedupeAddresses([fromLine, source.to || ""], exclude) : composeDedupeAddresses([fromLine], exclude)
+    var replyTo = composeRecipientAddress(source.from_name, source.from_email)
+    vals.to = mode === "reply-all" ? composeDedupeAddresses([replyTo, source.to || ""], exclude) : composeDedupeAddresses([replyTo], exclude)
     vals.cc = mode === "reply-all" ? composeDedupeAddresses([source.cc || ""], exclude) : ""
-    vals.subject = /^Re:/i.test(source.subject || "") ? source.subject : "Re: " + (source.subject || "")
+    vals.subject = /^(Re:|(回复|答复)[:：])/i.test(source.subject || "") ? source.subject : "Re: " + (source.subject || "")
     vals.body = composeReplyPlain(source)
     vals.html_body = composeReplyHTML(source)
     vals.in_reply_to = composeNormalizeMessageID(source.message_id)
     vals.references = composeReferencesForReply(source)
     vals._ccVisible = !!vals.cc
   } else {
-    vals.subject = /^(Fwd?|RV):/i.test(source.subject || "") ? source.subject : "Fwd: " + (source.subject || "")
+    vals.subject = /^((Fwd?|RV):|转发[:：])/i.test(source.subject || "") ? source.subject : "Fwd: " + (source.subject || "")
     vals.body = composeForwardPlain(source)
     vals.html_body = composeForwardHTML(source)
     vals.attachments = source.attachments || []
@@ -24405,10 +24623,13 @@ window.addEventListener("message", function (e) {
     var height = Number(e.data.height)
     if (!isFinite(height) || height < 0) return
     iframe._bodyReported = true
-    iframe.style.height = Math.ceil(height) + "px"
     // A collapsed thread message isn't laid out, so its body reports a height
     // for no width at all. Expanding it waits for a report at its real width.
-    iframe._bodyMeasuredWidth = iframe.clientWidth
+    // The body sends the width it was laid out at; reading the frame's width
+    // here instead laid the page out for every report.
+    var reportedWidth = Number(e.data.width)
+    iframe._bodyMeasuredWidth = isFinite(reportedWidth) && e.data.width !== undefined ? Math.round(reportedWidth) : iframe.clientWidth
+    iframe.style.height = Math.ceil(height) + "px"
     iframe.dispatchEvent(new CustomEvent("gofer:body-measured"))
     iframe.classList.remove("opacity-0")
     var loader = document.querySelector('[data-email-body-loading="' + emailId + '"]')
@@ -24419,8 +24640,8 @@ window.addEventListener("message", function (e) {
     }
   }
   if (e.data.type === "remoteContentBlocked") {
-    var banner = document.querySelector('[data-remote-content-banner="' + emailId + '"]')
-    if (banner) banner.classList.remove("hidden")
+    var banners = document.querySelectorAll('[data-remote-content-banner="' + emailId + '"]')
+    for (var b = 0; b < banners.length; b++) banners[b].classList.remove("hidden")
   }
   if (e.data.type === "emailBodyError") {
     iframe._bodyReported = true
@@ -24667,14 +24888,19 @@ function loadRemoteContent(emailId) {
   var url = new URL(src, window.location.origin)
   url.searchParams.set("remote", "true")
   setEmailBodyFrameSrc(iframe, url.toString())
-  var banner = document.querySelector('[data-remote-content-banner="' + emailId + '"]')
-  if (banner) banner.remove()
+  removeRemoteContentBanners(emailId)
   iframe.dataset.remoteLoaded = "true"
+}
+
+// removeRemoteContentBanners removes both versions of a message's blocked
+// images notice: the wide bar and the small screens' icon.
+function removeRemoteContentBanners(emailId) {
+  var banners = document.querySelectorAll('[data-remote-content-banner="' + emailId + '"]')
+  for (var i = 0; i < banners.length; i++) banners[i].remove()
 }
 
 function allowRemoteContent(emailId, mode) {
   var iframe = document.querySelector('[data-email-body-frame][data-email-id="' + emailId + '"]')
-  var banner = document.querySelector('[data-remote-content-banner="' + emailId + '"]')
 
   fetch("/api/remote-content/" + emailId + "/allow", {
     method: "POST",
@@ -24683,7 +24909,7 @@ function allowRemoteContent(emailId, mode) {
   })
     .then(function (r) { return r.json() })
     .then(function () {
-      if (banner) banner.remove()
+      removeRemoteContentBanners(emailId)
       if (iframe) iframe.dataset.remoteLoaded = "true"
       if (iframe && emailBodyFrameSrc(iframe)) {
         var url = new URL(emailBodyFrameSrc(iframe), window.location.origin)
@@ -24712,8 +24938,27 @@ function oppositeEmailBodyTheme(theme) {
   return theme === "dark" ? "light" : "dark"
 }
 
+// The palette is kept until the next frame: each message of a conversation
+// reads it in turn, and every probe made the browser restyle the whole page.
+var emailBodyPaletteCache = {}
+var emailBodyPaletteCacheFrame = 0
+
 function readEmailBodyPalette(theme) {
   var themeStyle = (window.GoferSettings && GoferSettings.get("theme_style")) || document.documentElement.getAttribute("data-theme") || "classic"
+  var cacheKey = themeStyle + "|" + theme
+  if (emailBodyPaletteCache[cacheKey]) return Object.assign({}, emailBodyPaletteCache[cacheKey])
+  var palette = probeEmailBodyPalette(themeStyle, theme)
+  emailBodyPaletteCache[cacheKey] = palette
+  if (!emailBodyPaletteCacheFrame) {
+    emailBodyPaletteCacheFrame = requestAnimationFrame(function () {
+      emailBodyPaletteCacheFrame = 0
+      emailBodyPaletteCache = {}
+    })
+  }
+  return Object.assign({}, palette)
+}
+
+function probeEmailBodyPalette(themeStyle, theme) {
   var probe = document.createElement("div")
   probe.setAttribute("data-theme", themeStyle)
   // Picks up the style's changed colors, which apply to probes too.
@@ -26366,6 +26611,50 @@ function cancelCalendarHold() {
   clearTimeout(_calendarHold.timer)
   _calendarHold = null
 }
+
+// On a touch screen, a quick sideways swipe on the calendar goes to the next
+// or previous month or week, as the arrows do (and with their slide). A
+// surface that scrolls sideways scrolls first: the swipe only turns the page
+// once it was already at that edge. Holds, drags and range picks don't count.
+var _calendarSwipe = null
+var CALENDAR_SWIPE_MIN_PX = 60
+
+document.addEventListener("touchstart", function (event) {
+  _calendarSwipe = null
+  if (event.touches.length !== 1) return
+  var surface = event.target.closest && event.target.closest("#calendar-main [data-calendar-surface]")
+  if (!surface || surface.hasAttribute("inert")) return
+  var touch = event.touches[0]
+  _calendarSwipe = {
+    x: touch.clientX,
+    y: touch.clientY,
+    time: Date.now(),
+    atStart: surface.scrollLeft <= 0,
+    atEnd: surface.scrollLeft + surface.clientWidth >= surface.scrollWidth - 1,
+  }
+}, {passive: true})
+
+document.addEventListener("touchmove", function (event) {
+  if (_calendarSwipe && event.touches.length !== 1) _calendarSwipe = null
+}, {passive: true})
+
+document.addEventListener("touchend", function (event) {
+  var swipe = _calendarSwipe
+  _calendarSwipe = null
+  if (!swipe || event.changedTouches.length !== 1) return
+  if ((_calendarDrag && _calendarDrag.started) || (_calendarPick && _calendarPick.started)) return
+  var touch = event.changedTouches[0]
+  var dx = touch.clientX - swipe.x
+  var dy = touch.clientY - swipe.y
+  if (Math.abs(dx) < CALENDAR_SWIPE_MIN_PX || Math.abs(dx) < Math.abs(dy) * 1.5 || Date.now() - swipe.time > 800) return
+  // A swipe to the left brings in what comes after.
+  var step = dx < 0 ? 1 : -1
+  if (step === 1 ? !swipe.atEnd : !swipe.atStart) return
+  var arrow = document.querySelector('#calendar-main [data-calendar-navigate="' + step + '"]')
+  if (arrow) arrow.click()
+}, {passive: true})
+
+document.addEventListener("touchcancel", function () { _calendarSwipe = null }, {passive: true})
 
 // Once a touch drag has started, the finger moves it instead of scrolling,
 // and holding doesn't open the browser's menu.

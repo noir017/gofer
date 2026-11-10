@@ -35,9 +35,6 @@ RUN set -eu; \
 WORKDIR /src
 
 COPY go.mod go.sum ./
-# The go.mod replace directive points at this directory, so it must exist
-# before `go mod download`.
-COPY third_party ./third_party
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY . .

@@ -177,6 +177,108 @@
   });
 })();
 
+// Fonts. The text and heading fonts come from the Google Fonts library. Each
+// picker arrives with the built-in font and the chosen one; the rest of the
+// library is added once the server has listed it. "default" is the built-in
+// font, saved as "". Express keeps its own font, so the pickers are greyed out
+// while it is the style.
+(function() {
+  // The list is fetched once and shared by every copy of the card, since
+  // Appearance is drawn again when themes change.
+  var loading = null;
+
+  function fill(picker) {
+    var group = picker.querySelector('[data-font-options]');
+    if (!group) return;
+    if (!loading) {
+      loading = fetch('/api/fonts/google', { credentials: 'same-origin' })
+        .then(function(res) { return res.ok ? res.json() : Promise.reject(res.status); })
+        .catch(function() { loading = null; return []; });
+    }
+    loading.then(function(families) {
+      if (!families.length) return;
+      var builtIn = group.querySelector('[data-tui-selectbox-value="default"] .select-item-text');
+      var entries = [['default', builtIn ? builtIn.textContent.trim() : 'default']];
+      families.forEach(function(family) { entries.push([family.family, family.family]); });
+      // selectbox.js builds the items when the menu is first opened.
+      group.setAttribute('data-tui-selectbox-lazy-items', JSON.stringify(entries));
+    });
+  }
+
+  function syncExpress(style) {
+    var card = document.querySelector('[data-font-settings]');
+    if (!card) return;
+    var express = style === 'express';
+    var note = card.querySelector('[data-font-settings-express]');
+    if (note) note.classList.toggle('hidden', !express);
+    card.querySelectorAll('[data-font-setting-row]').forEach(function(row) {
+      row.classList.toggle('opacity-50', express);
+    });
+    card.querySelectorAll('button.select-trigger').forEach(function(trigger) {
+      trigger.disabled = express;
+    });
+  }
+
+  // Each name is drawn in its own font once it scrolls into view, from a
+  // stylesheet with just the letters of the name (see googlefonts.Preview).
+  var previewed = {};
+  var observer = 'IntersectionObserver' in window ? new IntersectionObserver(function(entries) {
+    entries.forEach(function(entry) {
+      if (!entry.isIntersecting) return;
+      observer.unobserve(entry.target);
+      preview(entry.target);
+    });
+  }) : null;
+
+  function preview(item) {
+    var name = item.getAttribute('data-tui-selectbox-value');
+    var text = item.querySelector('.select-item-text');
+    if (!name || !text) return;
+    if (name === 'default') {
+      var group = item.closest('[data-font-options]');
+      var builtIn = group && group.getAttribute('data-font-builtin');
+      if (builtIn) text.style.fontFamily = '"' + builtIn + '"';
+      return;
+    }
+    if (!previewed[name]) {
+      previewed[name] = true;
+      var link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = '/fonts/google/preview.css?family=' + encodeURIComponent(name);
+      link.setAttribute('data-font-preview', '');
+      document.head.appendChild(link);
+    }
+    text.style.fontFamily = '"Gofer Preview ' + name + '", var(--font-sans)';
+  }
+
+  function watch(picker) {
+    if (!observer) return;
+    picker.querySelectorAll('[data-font-options] .select-item').forEach(function(item) {
+      if (item._fontPreviewWatched) return;
+      item._fontPreviewWatched = true;
+      observer.observe(item);
+    });
+  }
+
+  goferOnContent('[data-font-picker]', fill);
+  // selectbox.js adds the library's items as the menu opens, so they are
+  // watched right after.
+  ['pointerdown', 'keydown', 'focusin'].forEach(function(type) {
+    document.addEventListener(type, function(e) {
+      var trigger = e.target.closest && e.target.closest('[data-font-picker] button.select-trigger');
+      if (trigger) setTimeout(function() { watch(trigger.closest('[data-font-picker]')); }, 0);
+    });
+  });
+  document.addEventListener('change', function(e) {
+    var input = e.target.closest && e.target.closest('input[data-font-setting]');
+    if (!input || !input.value || typeof GoferSettings === 'undefined') return;
+    GoferSettings.set(input.getAttribute('data-font-setting'), input.value === 'default' ? '' : input.value);
+  });
+  document.body.addEventListener('gofer:settings-changed', function(e) {
+    if (e.detail && e.detail.key === 'theme_style') syncExpress(e.detail.value);
+  });
+})();
+
 // Style colors. A style's changed colors are saved as theme_colors_<style>,
 // and every edit is previewed on the page with CSS from the server. Closing
 // the editor without saving puts the page back as it was.
@@ -750,7 +852,7 @@
       if (seq !== frameSeq || !editing) return;
       var head = ['<meta charset="utf-8">'];
       document.querySelectorAll('head link[rel="stylesheet"], head style').forEach(function(node) {
-        if (node.matches('style[data-custom-theme], style[data-theme-colors]')) return;
+        if (node.matches('style[data-custom-theme], style[data-theme-colors], link[data-font-preview]')) return;
         if (node.tagName === 'LINK') head.push('<link rel="stylesheet" href="' + attribute(node.href) + '">');
         else head.push('<style>' + node.textContent + '</style>');
       });
@@ -1952,6 +2054,10 @@ function wizardServiceNext(button, service, step) {
   var contactForm = service === 'contacts' ? root.querySelector('[data-wizard-contact-form]') : null;
   var calendarForm = service === 'calendar' && enabled ? root.querySelector('[data-calendar-source-form]') : null;
   if (enabled && contactForm) {
+    // Done finishes the wizard once the contacts are saved (see the
+    // contact form's afterRequest below); Next goes on to its next step.
+    if (step === 'done') contactForm.dataset.wizardFinish = 'true';
+    else delete contactForm.dataset.wizardFinish;
     if (contactForm.requestSubmit) contactForm.requestSubmit(); else contactForm.submit();
     return;
   }
@@ -2213,7 +2319,19 @@ function openAddAccountWizard(service) {
   setAddAccountMailService(service);
   var root = document.getElementById('add-account-dialog');
   if (root) delete root.dataset.addMail;
+  setAddAccountProxyRow('');
   goferSwitchDialog('choose-account-type-dialog', 'add-account-dialog');
+}
+// The add wizard's Proxy row is for the account being added, or, adding mail
+// to an account, that account's own: its choice is the one finding and
+// testing the servers go through, and changing it saves it to the account.
+function setAddAccountProxyRow(accountID) {
+  var slot = document.getElementById('add-account-proxy-row');
+  if (!slot || !window.htmx) return;
+  accountID = accountID || '';
+  if ((slot.dataset.account || '') === accountID) return;
+  slot.dataset.account = accountID;
+  htmx.ajax('GET', '/api/accounts/proxy-choice?sidebar=1&form=account-form&account=' + encodeURIComponent(accountID), { target: slot, swap: 'innerHTML' });
 }
 // An account with only calendars or contacts gets its mail through the add
 // wizard, which then saves the mailbox to that account instead of creating
@@ -2236,6 +2354,7 @@ function startAddMail(service) {
   if (!_addMailAccount || !root || !form) return;
   setAddAccountMailService(service);
   root.dataset.addMail = _addMailAccount.id;
+  setAddAccountProxyRow(_addMailAccount.id);
   var name = form.querySelector('input[name="display_name"]');
   if (name && !name.value) name.value = _addMailAccount.name;
   goferSwitchDialog('choose-mail-type-dialog', 'add-account-dialog');
@@ -2406,6 +2525,9 @@ function discoverMailSettings(button) {
   status.innerHTML = '<div class="rounded-lg border border-border bg-background/60 p-3 text-xs text-muted-foreground"><div class="flex items-center gap-2"><span class="size-3.5 rounded-full border-2 border-muted-foreground/30 border-t-muted-foreground animate-spin"></span><span>' + mailDiscoveryEscape(goferT("js.settings.discovery.checking")) + '</span></div></div>';
   var body = new URLSearchParams();
   body.append('email_address', email.value.trim());
+  // Discovery connects through the proxy the account will use.
+  var proxy = form ? form.elements.namedItem('proxy') : null;
+  if (proxy && proxy.value !== undefined) body.append('proxy', proxy.value);
   fetch('/api/accounts/discover', {
     method: 'POST',
     credentials: 'same-origin',
@@ -2904,6 +3026,8 @@ document.body.addEventListener('htmx:afterRequest', function(event) {
   if (!form) return;
     var xhr = event.detail && event.detail.xhr ? event.detail.xhr : null;
     var ok = !!(event.detail && event.detail.successful) && (!xhr || xhr.getResponseHeader('X-Gofer-Status') !== 'error');
+    var finish = form.dataset.wizardFinish === 'true';
+    delete form.dataset.wizardFinish;
     if (!ok) return;
     var root = form.closest('#add-account-dialog,#edit-account-dialog');
     var toggle = root && root.querySelector('[data-wizard-service-switch="contacts"]');
@@ -2914,7 +3038,7 @@ document.body.addEventListener('htmx:afterRequest', function(event) {
       syncWizardServiceContent(root);
       if (root.id === 'add-account-dialog') syncAddContactStep();
     }
-    if (root) wizardServiceAdvance(root, Number(form.dataset.wizardNextStep || 0));
+    if (root) wizardServiceAdvance(root, finish ? 'done' : Number(form.dataset.wizardNextStep || 0));
   });
 function refreshCardDAVBaseURLActions(root) {
   (root || document).querySelectorAll('[data-carddav-base-url-action]').forEach(function(group) {
@@ -3092,7 +3216,9 @@ document.addEventListener('htmx:afterRequest', function(event) {
   } else if (note) {
     var labels = remaining.map(function(item) { return goferT("js.settings.reconnect.item." + item); });
     var text = note.querySelector('[data-reconnect-note]');
-    var list = labels.length > 1 ? goferT("js.common.and", { first: labels.slice(0, -1).join(', '), second: labels[labels.length - 1] }) : labels[0];
+    var list = labels[0];
+    for (var i = 1; i < labels.length - 1; i++) list = goferT("js.common.list_comma", { first: list, next: labels[i] });
+    if (labels.length > 1) list = goferT("js.common.and", { first: list, second: labels[labels.length - 1] });
     if (text) text.textContent = goferTn("js.settings.reconnect.saved", labels.length, { list: list });
   }
   updateReconnectGates();

@@ -1,8 +1,18 @@
 // List rows are sized in rem so they grow with the root font size on small screens; this
 // converts those sizes to the pixels the virtual lists position rows with.
+// How long opening a thread waits for its messages before showing
+// placeholders (VirtualMailList.toggleThreadExpand).
+var THREAD_PLACEHOLDER_WAIT = 100
+
+// The root size is read once a frame: a list being set up asks many times,
+// and each read made the browser restyle the page.
+var listRootFontPx = 0
 function listRemPx(rem) {
-  var root = parseFloat(window.getComputedStyle(document.documentElement).fontSize) || 16
-  return Math.round(rem * root)
+  if (!listRootFontPx) {
+    listRootFontPx = parseFloat(window.getComputedStyle(document.documentElement).fontSize) || 16
+    requestAnimationFrame(function () { listRootFontPx = 0 })
+  }
+  return Math.round(rem * listRootFontPx)
 }
 
 // Search results show where they are in a band (data-search-group): along
@@ -203,6 +213,8 @@ class VirtualMailList {
     this.itemHeight = listRemPx(this.viewMode === "table" ? 2.75 : mailCardRowRem())
     this.subItemHeight = listRemPx(this.viewMode === "table" ? 2 : 3)
     this.expandedThreadGap = 26
+    // Thread messages being fetched, by the row's email id.
+    this.threadFetches = new Map()
     this.overscan = 10
 
     this.cache = new Map()
@@ -417,7 +429,7 @@ class VirtualMailList {
     if (!this.expandedThreads || this.expandedThreads.size === 0) return null
     var snapshot = new Map()
     this.expandedThreads.forEach(function (thread, emailId) {
-      if (!thread || !thread.html || thread.collapsing) return
+      if (!thread || !thread.html || thread.collapsing || thread.placeholder) return
       snapshot.set(emailId, {
         html: thread.html,
         subCount: thread.subCount || 0,
@@ -462,7 +474,10 @@ class VirtualMailList {
     if (Math.abs((expanded.measuredHeight || 0) - measured) <= 1) return
     expanded.measuredHeight = measured
     this.invalidateOffsets()
-    this.scheduleMeasuredLayoutRefresh()
+    // Measured while the list is being drawn, the rows after it are placed
+    // again before that draw ends, so they never show a frame at the guess.
+    if (this._renderDepth) this._measuredDuringRender = true
+    else this.scheduleMeasuredLayoutRefresh()
   }
 
   scheduleMeasuredLayoutRefresh() {
@@ -609,7 +624,22 @@ class VirtualMailList {
     var height = this.totalHeight() + "px"
     if (this.itemsContainer.style.height !== height) this.itemsContainer.style.height = height
 
-    var stamped = this.renderPooled(first, last)
+    this._renderDepth = (this._renderDepth || 0) + 1
+    var stamped
+    try {
+      stamped = this.renderPooled(first, last)
+      if (this._measuredDuringRender && this._renderDepth === 1) {
+        this._measuredDuringRender = false
+        // Only the rows' places change: renderPooled keeps the content it
+        // has already stamped. The next frame then fills the visible range
+        // again, which the new height may have grown or shrunk.
+        this.renderPooled(first, last)
+        this.scheduleMeasuredLayoutRefresh()
+      }
+    } finally {
+      this._renderDepth--
+      this._measuredDuringRender = false
+    }
     if (scrolling) {
       for (var i = 0; i < stamped.length; i++) {
         if (typeof window.syncMailRowSelection === "function") window.syncMailRowSelection(stamped[i])
@@ -1228,24 +1258,33 @@ class VirtualMailList {
     }, duration + 40)
   }
 
+  // Every row is measured first, then every moved row put back where it was,
+  // then the page laid out once before they slide. Measuring and moving each
+  // row in turn laid out the whole list twice per row, which on a phone held
+  // a thread's expansion for over a second, as animateListTransition once did.
   animateLayoutShift(previousLayout) {
     if (!previousLayout || previousLayout.size === 0) return
+    var moving = []
     for (var i = 0; i < this.itemsContainer.children.length; i++) {
       var node = this.itemsContainer.children[i]
       var row = node.classList.contains("mail-list-item") ? node : node.querySelector(".mail-list-item")
       if (!row || !row.dataset.emailId) continue
       var oldRect = previousLayout.get(row.dataset.emailId)
       if (!oldRect) continue
-      var newRect = node.getBoundingClientRect()
-      var dy = oldRect.top - newRect.top
+      var dy = oldRect.top - node.getBoundingClientRect().top
       if (Math.abs(dy) < 1) continue
-      var baseTransform = node.style.transform || ""
-      node.style.transition = "none"
-      node.style.transform = baseTransform + " translateY(" + dy + "px)"
-      node.offsetHeight
-      node.style.transition = "transform 120ms ease-out"
-      node.style.transform = baseTransform
-      this.cleanupTransition(node, 120)
+      moving.push({ node: node, dy: dy, base: node.style.transform || "" })
+    }
+    if (!moving.length) return
+    for (var m = 0; m < moving.length; m++) {
+      moving[m].node.style.transition = "none"
+      moving[m].node.style.transform = moving[m].base + " translateY(" + moving[m].dy + "px)"
+    }
+    this.itemsContainer.offsetHeight
+    for (var n = 0; n < moving.length; n++) {
+      moving[n].node.style.transition = "transform 120ms ease-out"
+      moving[n].node.style.transform = moving[n].base
+      this.cleanupTransition(moving[n].node, 120)
     }
   }
 
@@ -2783,6 +2822,10 @@ class VirtualMailList {
     if (window.location.pathname + window.location.search !== path) {
       // fromList lets the small-screen back button return to the list with history.back().
       var fromList = !!this.selectedEmailId && !(history.state && history.state.email)
+      // The list's own address, as it was loaded or last written: going back
+      // to it closes the message in place (see mailListPopState).
+      // A page opened straight on a message has no list address to go to.
+      if (fromList && !/^\/folder\/[^/]+\/[^/]+$/.test(window.location.pathname)) this.listAddress = window.location.pathname + window.location.search
       history.pushState({ folder: this.folderID, email: this.selectedEmailId, fromList: fromList }, "", path)
     }
   }
@@ -2794,6 +2837,7 @@ class VirtualMailList {
     if (this.searchScope && this.selectedEmailId) query.set("selected", this.selectedEmailId)
     if (query.toString()) path += "?" + query.toString()
     history.replaceState({ folder: this.folderID, email: this.selectedEmailId || null }, "", path)
+    if (!this.selectedEmailId) this.listAddress = path
   }
 
   showNewEmailBanner() {
@@ -3007,6 +3051,13 @@ class VirtualMailList {
       .catch(function () {})
   }
 
+  // toggleThreadExpand opens or closes a thread under its row. Closing is
+  // immediate: the rows below slide up into place. Opening uses the request
+  // a touch on the toggle may already have started (prefetchThreadSubItems):
+  // messages already in, or in within THREAD_PLACEHOLDER_WAIT, are shown
+  // straight away. Slower ones get as many placeholder rows as the thread
+  // has messages, which the messages replace when they arrive; drawing the
+  // placeholders first only made a quick answer show later.
   async toggleThreadExpand(emailId, options) {
     var pos = this.indexById.get(emailId)
     if (pos === undefined) return
@@ -3015,78 +3066,133 @@ class VirtualMailList {
     var previousLayout = this.captureRenderedLayout()
 
     if (this.expandedThreads.has(emailId)) {
-      if (this.viewMode === "table") {
-        this.expandedThreads.delete(emailId)
-        this.invalidateOffsets()
-        this.prevFirst = null
-        this.prevLast = null
-        this.render()
-        this.animateLayoutShift(previousLayout)
-        return
-      }
-
-      var expanded = this.expandedThreads.get(emailId)
-      expanded.entering = false
-      expanded.collapsing = true
-      this.prevFirst = null
-      this.prevLast = null
-      this.render()
-      var self = this
-      setTimeout(function () {
-        if (!self.expandedThreads.has(emailId)) return
-        var collapseLayout = self.captureRenderedLayout()
-        self.expandedThreads.delete(emailId)
-        self.invalidateOffsets()
-        self.prevFirst = null
-        self.prevLast = null
-        self.render()
-        self.animateLayoutShift(collapseLayout)
-      }, 110)
+      this.threadFetches.delete(emailId)
+      this.expandedThreads.delete(emailId)
+      this.redrawThreads(previousLayout)
       return
     }
 
-    var item = this.cache.get(pos)
-    if (!item) return
+    if (!this.cache.get(pos)) return
+    var request = this.prefetchThreadSubItems(emailId)
+    if (!request) return
+    var quick = await Promise.race([
+      request.then(function (html) { return { html: html } }, function () { return { failed: true } }),
+      new Promise(function (resolve) { setTimeout(resolve, THREAD_PLACEHOLDER_WAIT) }),
+    ])
+    if (quick) {
+      this.threadFetches.delete(emailId)
+      if (this.expandedThreads.has(emailId)) return
+      var quickSub = quick.html ? this.threadSubItemsHTML(quick.html, emailId) : null
+      if (!quickSub) return
+      var quickLayout = this.captureRenderedLayout()
+      this.expandedThreads.set(emailId, { subCount: quickSub.count, html: quickSub.html, entering: true })
+      this.redrawThreads(quickLayout)
+      var quickSelf = this
+      if (this.viewMode === "table") requestAnimationFrame(function () { quickSelf.finishThreadEnter(emailId) })
+      else setTimeout(function () { quickSelf.finishThreadEnter(emailId) }, 130)
+      return
+    }
+    if (this.expandedThreads.has(emailId)) return
+    previousLayout = this.captureRenderedLayout()
+    var expanded = {
+      subCount: this.threadPlaceholderCount(emailId),
+      html: "",
+      entering: true,
+      placeholder: true,
+    }
+    expanded.html = this.threadPlaceholderHTML(expanded.subCount)
+    this.expandedThreads.set(emailId, expanded)
+    this.redrawThreads(previousLayout)
+    var self = this
+    if (this.viewMode === "table") requestAnimationFrame(function () { self.finishThreadEnter(emailId) })
+    else setTimeout(function () { self.finishThreadEnter(emailId) }, 130)
 
+    var html
     try {
-      var threadId = this.getThreadDataAttr(emailId)
-      if (!threadId) return
-      var threadURL = this.searchScope ? this.withFilterParams("/mail/search/thread/" + encodeURIComponent(emailId) + "/subitems") : "/mail/thread/" + encodeURIComponent(threadId) + "/subitems"
-      var html = await this.fetchHTML(threadURL)
-      var tmp = document.createElement("template")
-      tmp.innerHTML = html
-      var wrapper = tmp.content.firstElementChild
-      if (!wrapper) return
-
-      var subItems = wrapper.querySelectorAll("[data-sub-email-id]")
-      var subHtml = ""
-      var subCount = 0
-      for (var i = 0; i < subItems.length; i++) {
-        if (subItems[i].dataset.subEmailId === emailId) continue
-        subHtml += subItems[i].outerHTML
-        subCount++
-      }
-
-      this.expandedThreads.set(emailId, {
-        subCount: subCount,
-        html: subHtml,
-        entering: true
-      })
-      this.invalidateOffsets()
-      this.prevFirst = null
-      this.prevLast = null
-      this.render()
-      var self = this
-      if (this.viewMode === "table") {
-        this.animateLayoutShift(previousLayout)
-        requestAnimationFrame(function () { self.finishThreadEnter(emailId) })
-      } else {
-        this.animateLayoutShift(previousLayout)
-        setTimeout(function () { self.finishThreadEnter(emailId) }, 130)
-      }
+      html = await request
     } catch (e) {
       console.error("Failed to expand thread:", e)
+      html = null
     }
+    this.threadFetches.delete(emailId)
+    // Closed, or opened again, while the messages were on their way.
+    if (this.expandedThreads.get(emailId) !== expanded) return
+    var sub = html ? this.threadSubItemsHTML(html, emailId) : null
+    var arrivedLayout = this.captureRenderedLayout()
+    if (!sub) {
+      this.expandedThreads.delete(emailId)
+      this.redrawThreads(arrivedLayout)
+      return
+    }
+    expanded.html = sub.html
+    expanded.subCount = sub.count
+    expanded.placeholder = false
+    expanded.measuredHeight = 0
+    this.redrawThreads(arrivedLayout)
+  }
+
+  // threadSubItemsHTML is a thread's messages, other than the row's own, from
+  // the server's answer, or null when there are none.
+  threadSubItemsHTML(html, emailId) {
+    var tmp = document.createElement("template")
+    tmp.innerHTML = html
+    var wrapper = tmp.content.firstElementChild
+    var subItems = wrapper ? wrapper.querySelectorAll("[data-sub-email-id]") : []
+    var out = ""
+    var count = 0
+    for (var i = 0; i < subItems.length; i++) {
+      if (subItems[i].dataset.subEmailId === emailId) continue
+      out += subItems[i].outerHTML
+      count++
+    }
+    return count ? { html: out, count: count } : null
+  }
+
+  // redrawThreads draws the list after a thread opened, closed or filled in,
+  // and slides the rows that moved from where they were.
+  redrawThreads(previousLayout) {
+    this.invalidateOffsets()
+    this.prevFirst = null
+    this.prevLast = null
+    this.render()
+    this.animateLayoutShift(previousLayout)
+  }
+
+  // prefetchThreadSubItems starts fetching a thread's messages, or returns
+  // the request already on its way. A touch on the toggle starts it, so the
+  // messages are often in by the time the tap ends.
+  prefetchThreadSubItems(emailId) {
+    var started = this.threadFetches.get(emailId)
+    if (started && Date.now() - started.at < 10000) return started.request
+    var threadId = this.getThreadDataAttr(emailId)
+    if (!threadId) return null
+    var threadURL = this.searchScope ? this.withFilterParams("/mail/search/thread/" + encodeURIComponent(emailId) + "/subitems") : "/mail/thread/" + encodeURIComponent(threadId) + "/subitems"
+    var request = this.fetchHTML(threadURL)
+    request.catch(function () {})
+    this.threadFetches.set(emailId, { at: Date.now(), request: request })
+    return request
+  }
+
+  // threadPlaceholderCount is how many messages the thread shows besides the
+  // row's own, from its count, kept to a screenful.
+  threadPlaceholderCount(emailId) {
+    var el = this.container.querySelector('[data-email-id="' + emailId + '"]')
+    var count = el ? parseInt(el.dataset.threadCount, 10) : NaN
+    if (isNaN(count) || count < 2) return 1
+    return Math.min(count - 1, 8)
+  }
+
+  threadPlaceholderHTML(count) {
+    var row =
+      '<div class="thread-sub-item" data-thread-placeholder aria-hidden="true"><a class="flex items-start gap-2.5 px-3 py-1.5" tabindex="-1">' +
+      '<div class="flex items-center justify-center shrink-0" data-mail-table-cell="accountMarker"><span class="size-2.5 shrink-0 rounded-sm bg-muted animate-pulse"></span></div>' +
+      '<div data-mail-table-cell="thread"><span class="block size-5 rounded-full bg-muted animate-pulse mt-0.5"></span></div>' +
+      '<div class="flex-1 min-w-0"><div class="flex items-center justify-between gap-2"><span class="h-3 w-28 rounded bg-muted animate-pulse" data-mail-table-cell="from"></span><span class="h-2.5 w-10 rounded bg-muted animate-pulse" data-mail-table-cell="date"></span></div>' +
+      '<p class="mt-1.5 h-2.5 w-44 max-w-full rounded bg-muted animate-pulse" data-mail-table-cell="subject"></p></div>' +
+      "</a></div>"
+    var html = ""
+    for (var i = 0; i < count; i++) html += row
+    return html
   }
 
   getThreadDataAttr(emailId) {
@@ -4252,7 +4358,31 @@ Object.assign(VirtualContactsList.prototype, otherViewRowsMethods)
 window.VirtualMailList = VirtualMailList
 window.VirtualContactsList = VirtualContactsList
 
+// mailListPopState is where the open mail list goes for an address back or
+// forward lands on, when that is the list itself: its own address, or one of
+// its messages under the same filters. The list then closes or opens the
+// message in place; anything else is for the router (navigation.js), which
+// loads the mail page again. Going back from a message used to do that, and
+// waited for the whole page on a phone.
+function mailListPopState(href) {
+  var container = document.getElementById("mail-list-scroll")
+  var vml = container && container.isConnected && container._virtualMailList
+  if (!vml || vml.searchScope) return null
+  var url = new URL(href, window.location.href)
+  if (url.origin !== window.location.origin) return null
+  if (vml.listAddress && url.pathname + url.search === vml.listAddress) return { folder: vml.folderID, email: null }
+  var message = /^\/folder\/([^/]+)\/([^/]+)$/.exec(url.pathname)
+  if (!message || decodeURIComponent(message[1]) !== vml.folderID) return null
+  if (url.search.replace(/^\?/, "") !== vml.filterQueryString()) return null
+  return { folder: vml.folderID, email: decodeURIComponent(message[2]) }
+}
+
 window.addEventListener("popstate", function (e) {
+  var inPlace = mailListPopState(window.location.href)
+  if (inPlace) {
+    moveMailListTo(inPlace)
+    return
+  }
   if (!e.state) return
   // Pages the app's router knows (navigation.js) are its to move between.
   // Listeners on the window run in the order they were added, and this one
@@ -4308,17 +4438,22 @@ window.addEventListener("popstate", function (e) {
   }
 
   if (!e.state.folder) return
+  moveMailListTo(e.state)
+})
 
+// moveMailListTo shows a mail history state: another folder, other filters,
+// or a message opened or closed in the same list.
+function moveMailListTo(state) {
   var container = document.getElementById("mail-list-scroll")
   if (!container || !container._virtualMailList) {
     if (typeof htmx !== "undefined") {
-      htmx.ajax("GET", "/folder/" + e.state.folder + "/full" + window.location.search, {target: "#main-content", swap: "outerHTML"})
+      htmx.ajax("GET", "/folder/" + state.folder + "/full" + window.location.search, {target: "#main-content", swap: "outerHTML"})
     }
     return
   }
 
   var vml = container._virtualMailList
-  var folderID = e.state.folder
+  var folderID = state.folder
   var oldNavigationState = JSON.stringify({ filters: vml.filters || {}, tag: vml.sidebarTag || {} })
   vml.filters = vml.readFiltersFromURL()
   vml.syncFilterInputs()
@@ -4406,20 +4541,20 @@ window.addEventListener("popstate", function (e) {
   } else if (navigationStateChanged) {
     vml.refreshCurrentFolder({ rebase: true }).catch(function () {})
     updateSidebarActive()
-  } else if (!e.state.email && vml.selectedEmailId) {
+  } else if (!state.email && vml.selectedEmailId) {
     var closedEmailId = vml.selectedEmailId
     vml.selectedEmailId = null
     vml.syncSelectionClasses(vml.itemsContainer)
     if (typeof setMailViewEmpty === "function") setMailViewEmpty()
     document.dispatchEvent(new CustomEvent("gofer:mail-view-closed", { detail: { emailId: closedEmailId } }))
-  } else if (e.state.email && e.state.email !== vml.selectedEmailId) {
-    vml.selectedEmailId = e.state.email
+  } else if (state.email && state.email !== vml.selectedEmailId) {
+    vml.selectedEmailId = state.email
     vml.prevFirst = null
     vml.prevLast = null
     vml.render()
     if (typeof htmx !== "undefined") {
       if (typeof showMailViewLoading === "function") showMailViewLoading()
-      htmx.ajax("GET", typeof mailViewRequestURL === "function" ? mailViewRequestURL(e.state.email) : "/email/" + e.state.email, "#mail-view")
+      htmx.ajax("GET", typeof mailViewRequestURL === "function" ? mailViewRequestURL(state.email) : "/email/" + state.email, "#mail-view")
     }
   }
-})
+}
